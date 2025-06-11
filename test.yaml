@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-default-pdb
+  namespace: castai-agent
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: app-default-pdb
+  template:
+    metadata:
+      labels:
+        app: app-default-pdb
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.25
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-minavailable
+  namespace: castai-agent
+  annotations:
+    workloads.cast.ai/pdb-minAvailable: "2"
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: app-minavailable
+  template:
+    metadata:
+      labels:
+        app: app-minavailable
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.25
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-maxunavailable
+  namespace: castai-agent
+  annotations:
+    workloads.cast.ai/pdb-maxUnavailable: "50%"
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: app-maxunavailable
+  template:
+    metadata:
+      labels:
+        app: app-maxunavailable
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.25
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-bypass-pdb
+  namespace: castai-agent
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: app-bypass-pdb
+  template:
+    metadata:
+      labels:
+        app: app-bypass-pdb
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.25
+
