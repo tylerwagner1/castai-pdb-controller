@@ -165,5 +165,3 @@ spec:
 
 For advanced usage, deployment via Helm, or troubleshooting, see the [controller source code](./main.go) and your cluster’s RBAC configuration.
 
-Sources
-# castai-pdb-controller
