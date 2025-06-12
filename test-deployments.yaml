@@ -23,7 +23,7 @@ metadata:
   name: app-minavailable
   namespace: castai-agent
   annotations:
-    workloads.cast.ai/pdb-minAvailable: "2"
+    workloads.cast.ai/pdb-minAvailable: "3"
 spec:
   replicas: 4
   selector:
@@ -44,7 +44,7 @@ metadata:
   name: app-maxunavailable
   namespace: castai-agent
   annotations:
-    workloads.cast.ai/pdb-maxUnavailable: "50%"
+    workloads.cast.ai/pdb-maxUnavailable: "10%"
 spec:
   replicas: 6
   selector:

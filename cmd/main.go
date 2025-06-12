@@ -119,12 +119,12 @@ func watchConfigMap(ctx context.Context, clientset *kubernetes.Clientset) {
     cmInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
         AddFunc: func(obj interface{}) {
             if cm, ok := obj.(*corev1.ConfigMap); ok && cm.Name == configMapName {
-                updateDefaultPDBConfig(cm)
+                updateDefaultPDBConfig(cm, clientset)
             }
         },
         UpdateFunc: func(oldObj, newObj interface{}) {
             if cm, ok := newObj.(*corev1.ConfigMap); ok && cm.Name == configMapName {
-                updateDefaultPDBConfig(cm)
+                updateDefaultPDBConfig(cm, clientset)
             }
         },
         DeleteFunc: func(obj interface{}) {
@@ -139,7 +139,7 @@ func watchConfigMap(ctx context.Context, clientset *kubernetes.Clientset) {
     <-ctx.Done()
 }
 
-func updateDefaultPDBConfig(cm *corev1.ConfigMap) {
+func updateDefaultPDBConfig(cm *corev1.ConfigMap, clientset *kubernetes.Clientset) {
     var minAvailable, maxUnavailable *intstr.IntOrString
     if val, ok := cm.Data["minAvailable"]; ok {
         minAvailable = parsePDBValue(val)
@@ -157,6 +157,9 @@ func updateDefaultPDBConfig(cm *corev1.ConfigMap) {
     defaultPDBConfig.MaxUnavailable = maxUnavailable
     defaultPDBConfigLock.Unlock()
     fmt.Printf("Default PDB config updated from ConfigMap: minAvailable=%v, maxUnavailable=%v\n", minAvailable, maxUnavailable)
+
+    // Reconcile all PDBs that use defaults
+    go reconcileAllDefaultPDBs(context.Background(), clientset)
 }
 
 func resetDefaultPDBConfig() {
@@ -173,7 +176,7 @@ func loadDefaultPDBConfig(ctx context.Context, clientset *kubernetes.Clientset) 
         fmt.Printf("Warning: could not load default PDB config, using built-in defaults: %v\n", err)
         return
     }
-    updateDefaultPDBConfig(cm)
+    updateDefaultPDBConfig(cm, clientset)
 }
 
 func runController(ctx context.Context, clientset *kubernetes.Clientset) {
@@ -274,6 +277,25 @@ func handleWorkloadUpdate(ctx context.Context, clientset *kubernetes.Clientset, 
         return
     }
 
+    // Check if minAvailable or maxUnavailable annotation changed
+    oldMin := ""
+    newMin := ""
+    oldMax := ""
+    newMax := ""
+    if oldAnnotations != nil {
+        oldMin = oldAnnotations[annotationMinAvailable]
+        oldMax = oldAnnotations[annotationMaxUnavailable]
+    }
+    if newAnnotations != nil {
+        newMin = newAnnotations[annotationMinAvailable]
+        newMax = newAnnotations[annotationMaxUnavailable]
+    }
+    if oldMin != newMin || oldMax != newMax {
+        fmt.Printf("PDB annotation changed for %s/%s, updating PDB\n", namespace, name)
+        createPDBForWorkload(ctx, clientset, newObj)
+        return
+    }
+
     // For all other updates, run normal logic
     createPDBForWorkload(ctx, clientset, newObj)
 }
@@ -302,10 +324,12 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
     var labels map[string]string
     var namespace, name string
     var workloadAnnotations map[string]string
+    var replicas *int32
 
     switch workload := obj.(type) {
     case *appsv1.Deployment:
-        if workload.Spec.Replicas == nil || *workload.Spec.Replicas < 2 {
+        replicas = workload.Spec.Replicas
+        if replicas == nil || *replicas < 2 {
             return
         }
         if workload.Annotations != nil {
@@ -318,7 +342,8 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
         namespace = workload.Namespace
         name = workload.Name
     case *appsv1.StatefulSet:
-        if workload.Spec.Replicas == nil || *workload.Spec.Replicas < 2 {
+        replicas = workload.Spec.Replicas
+        if replicas == nil || *replicas < 2 {
             return
         }
         if workload.Annotations != nil {
@@ -345,17 +370,20 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
     }
     for _, pdb := range pdbList.Items {
         if pdb.Spec.Selector != nil && anyLabelMatch(pdb.Spec.Selector.MatchLabels, labels) {
-            fmt.Printf("Skipping PDB creation for %s/%s: overlapping PDB %s exists\n", namespace, name, pdb.Name)
-            return
+            // If this is the castai-managed PDB for this workload, allow update
+            if pdb.Name == fmt.Sprintf("castai-%s-pdb", name) {
+                // Update logic handled below
+            } else {
+                fmt.Printf("Skipping PDB creation for %s/%s: overlapping PDB %s exists\n", namespace, name, pdb.Name)
+                return
+            }
         }
     }
 
     pdbName := fmt.Sprintf("castai-%s-pdb", name)
-    _, err = clientset.PolicyV1().PodDisruptionBudgets(namespace).Get(ctx, pdbName, metav1.GetOptions{})
-    if err == nil {
-        return
-    }
-    if !apierrors.IsNotFound(err) {
+    existingPDB, err := clientset.PolicyV1().PodDisruptionBudgets(namespace).Get(ctx, pdbName, metav1.GetOptions{})
+    exists := err == nil
+    if err != nil && !apierrors.IsNotFound(err) {
         fmt.Printf("Error checking for existing PDB %s/%s: %v\n", namespace, pdbName, err)
         return
     }
@@ -388,23 +416,55 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
         minAvailable = &intstr.IntOrString{Type: intstr.Int, IntVal: 1}
     }
 
+    pdbSpec := policyv1.PodDisruptionBudgetSpec{
+        Selector: &metav1.LabelSelector{
+            MatchLabels: labels,
+        },
+    }
+    if minAvailable != nil {
+        pdbSpec.MinAvailable = minAvailable
+    }
+    if maxUnavailable != nil {
+        pdbSpec.MaxUnavailable = maxUnavailable
+    }
+
+    if exists {
+        // Only update if spec has changed
+        needsUpdate := false
+        if existingPDB.Spec.MinAvailable == nil && pdbSpec.MinAvailable != nil {
+            needsUpdate = true
+        } else if existingPDB.Spec.MinAvailable != nil && pdbSpec.MinAvailable == nil {
+            needsUpdate = true
+        } else if existingPDB.Spec.MinAvailable != nil && pdbSpec.MinAvailable != nil &&
+            existingPDB.Spec.MinAvailable.String() != pdbSpec.MinAvailable.String() {
+            needsUpdate = true
+        }
+        if existingPDB.Spec.MaxUnavailable == nil && pdbSpec.MaxUnavailable != nil {
+            needsUpdate = true
+        } else if existingPDB.Spec.MaxUnavailable != nil && pdbSpec.MaxUnavailable == nil {
+            needsUpdate = true
+        } else if existingPDB.Spec.MaxUnavailable != nil && pdbSpec.MaxUnavailable != nil &&
+            existingPDB.Spec.MaxUnavailable.String() != pdbSpec.MaxUnavailable.String() {
+            needsUpdate = true
+        }
+        if needsUpdate {
+            existingPDB.Spec = pdbSpec
+            _, err := clientset.PolicyV1().PodDisruptionBudgets(namespace).Update(ctx, existingPDB, metav1.UpdateOptions{})
+            if err != nil {
+                fmt.Printf("Failed to update PDB for %s/%s: %v\n", namespace, name, err)
+            } else {
+                fmt.Printf("Updated PDB for %s/%s\n", namespace, name)
+            }
+        }
+        return
+    }
+
     pdb := &policyv1.PodDisruptionBudget{
         ObjectMeta: metav1.ObjectMeta{
             Name:      pdbName,
             Namespace: namespace,
         },
-        Spec: policyv1.PodDisruptionBudgetSpec{
-            Selector: &metav1.LabelSelector{
-                MatchLabels: labels,
-            },
-        },
-    }
-
-    if minAvailable != nil {
-        pdb.Spec.MinAvailable = minAvailable
-    }
-    if maxUnavailable != nil {
-        pdb.Spec.MaxUnavailable = maxUnavailable
+        Spec: pdbSpec,
     }
 
     _, err = clientset.PolicyV1().PodDisruptionBudgets(namespace).Create(ctx, pdb, metav1.CreateOptions{})
@@ -461,3 +521,54 @@ func garbageCollectOrphanedPDBs(ctx context.Context, clientset *kubernetes.Clien
     }
 }
 
+// Reconcile all workloads that use default PDB config
+func reconcileAllDefaultPDBs(ctx context.Context, clientset *kubernetes.Clientset) {
+    namespaces, err := clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+    if err != nil {
+        fmt.Printf("Failed to list namespaces: %v\n", err)
+        return
+    }
+    for _, ns := range namespaces.Items {
+        // Check Deployments
+        deployments, err := clientset.AppsV1().Deployments(ns.Name).List(ctx, metav1.ListOptions{})
+        if err == nil {
+            for _, d := range deployments.Items {
+                if !hasCustomPDBAnnotations(d.Annotations) && !hasBypassAnnotation(d.Annotations) && d.Spec.Replicas != nil && *d.Spec.Replicas >= 2 {
+                    createPDBForWorkload(ctx, clientset, &d)
+                }
+            }
+        }
+        // Check StatefulSets
+        statefulsets, err := clientset.AppsV1().StatefulSets(ns.Name).List(ctx, metav1.ListOptions{})
+        if err == nil {
+            for _, s := range statefulsets.Items {
+                if !hasCustomPDBAnnotations(s.Annotations) && !hasBypassAnnotation(s.Annotations) && s.Spec.Replicas != nil && *s.Spec.Replicas >= 2 {
+                    createPDBForWorkload(ctx, clientset, &s)
+                }
+            }
+        }
+    }
+}
+
+func hasCustomPDBAnnotations(annotations map[string]string) bool {
+    if annotations == nil {
+        return false
+    }
+    if _, ok := annotations[annotationMinAvailable]; ok {
+        return true
+    }
+    if _, ok := annotations[annotationMaxUnavailable]; ok {
+        return true
+    }
+    return false
+}
+
+func hasBypassAnnotation(annotations map[string]string) bool {
+    if annotations == nil {
+        return false
+    }
+    if val, ok := annotations[annotationBypass]; ok && val == "true" {
+        return true
+    }
+    return false
+}

@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: castai-pdb-controller-config
+  namespace: castai-agent
+data:
+  minAvailable: "25%"        # Default minAvailable if no annotation is set
+  # maxUnavailable: "50%"  # (Optional) Default maxUnavailable if no annotation is set
+
