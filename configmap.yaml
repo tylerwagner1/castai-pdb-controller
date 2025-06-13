@@ -6,5 +6,5 @@ metadata:
 data:
   minAvailable: "1"
   # maxUnavailable: "50%"  # Optional, use one or the other. Built-in defaults used if both are uncommented.
-  FixPoorPDBs: "true"      # Set to "true" for automatic correction, "false" for logging only
+  FixPoorPDBs: "false"      # Set to "true" for automatic correction, "false" for logging only
 

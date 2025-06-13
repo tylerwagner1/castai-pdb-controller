@@ -16,7 +16,8 @@ spec:
       serviceAccountName: castai-pdb-controller
       containers:
       - name: castai-pdb-controller
-        image: tylerwagner/castai-pdb-controller:1.24
+        image: tylerwagner/castai-pdb-controller:1.28
+
 
 
 

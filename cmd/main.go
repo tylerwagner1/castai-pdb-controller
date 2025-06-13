@@ -37,6 +37,7 @@ const (
     annotationBypass         = "workloads.cast.ai/bypass-default-pdb"
     skipLogInterval          = 15 * time.Minute
     warnLogInterval = 15 * time.Minute // or whatever interval you prefer
+    fixLogInterval = 15 * time.Minute // or whatever interval you prefer
 )
 
 type DefaultPDBConfig struct {
@@ -53,7 +54,20 @@ var (
     skipLogTimesLock sync.Mutex
     warnLogTimes     = make(map[string]time.Time)
     warnLogTimesLock sync.Mutex
+    fixLogTimes     = make(map[string]time.Time)
+    fixLogTimesLock sync.Mutex
 )
+
+func logFixPoorPDB(key, message string) {
+    now := time.Now()
+    fixLogTimesLock.Lock()
+    last, ok := fixLogTimes[key]
+    if !ok || now.Sub(last) > fixLogInterval {
+        log.Print(message)
+        fixLogTimes[key] = now
+    }
+    fixLogTimesLock.Unlock()
+}
 
 func logPoorPDBWarning(key, message string) {
     now := time.Now()
@@ -407,8 +421,25 @@ func logAndFixPoorPDBConfig(
         }
     }
 
+    // --- Bypass annotation check ---
     if poorConfig && fixPoor && workloadObj != nil {
-        log.Printf("FixPoorPDBs enabled: Deleting poor PDB %s/%s and recreating with defaults.\n", namespace, pdb.Name)
+        var annotations map[string]string
+        switch w := workloadObj.(type) {
+        case *appsv1.Deployment:
+            annotations = w.Annotations
+        case *appsv1.StatefulSet:
+            annotations = w.Annotations
+        }
+        if annotations != nil {
+            if val, ok := annotations[annotationBypass]; ok && val == "true" {
+                // Respect bypass annotation: do not delete or recreate PDB
+                return
+            }
+        }
+
+        key := fmt.Sprintf("%s/%s", namespace, pdb.Name)
+        msg := fmt.Sprintf("FixPoorPDBs enabled: Deleting poor PDB %s/%s and recreating with defaults.", namespace, pdb.Name)
+        logFixPoorPDB(key, msg)
         err := clientset.PolicyV1().PodDisruptionBudgets(namespace).Delete(ctx, pdb.Name, metav1.DeleteOptions{})
         if err != nil && !apierrors.IsNotFound(err) {
             log.Printf("Failed to delete poor PDB %s/%s: %v\n", namespace, pdb.Name, err)
@@ -468,21 +499,30 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
         log.Printf("Failed to list PDBs in namespace %s: %v\n", namespace, err)
         return
     }
+
+    foundNonPoorMatchingPDB := false
+    foundPoorMatchingPDB := false
+    fixPoor := false
+    defaultPDBConfigLock.RLock()
+    fixPoor = defaultPDBConfig.FixPoorPDBs
+    defaultPDBConfigLock.RUnlock()
+
     for _, pdb := range pdbList.Items {
-        // Only match on exact matchLabels, not matchExpressions
         if pdb.Spec.Selector != nil && selectorMatchesLabels(pdb.Spec.Selector.MatchLabels, labels) {
-            // Check if the PDB is poorly configured
-            fixPoor := false
-            defaultPDBConfigLock.RLock()
-            fixPoor = defaultPDBConfig.FixPoorPDBs
-            defaultPDBConfigLock.RUnlock()
             poorConfig := false
             if replicas != nil {
                 poorConfig = isPoorPDBConfig(&pdb, *replicas)
             }
-            if poorConfig && fixPoor && replicas != nil {
-                logAndFixPoorPDBConfig(ctx, clientset, &pdb, name, *replicas, namespace, obj)
-                // After fixing, do not return so the new PDB can be created
+            if poorConfig {
+                if fixPoor && replicas != nil {
+                    logAndFixPoorPDBConfig(ctx, clientset, &pdb, name, *replicas, namespace, obj)
+                    // Do not return; continue to check for other matching PDBs
+                } else {
+                    // Just log the warning, do not create a new PDB
+                    logAndFixPoorPDBConfig(ctx, clientset, &pdb, name, *replicas, namespace, obj)
+                    foundPoorMatchingPDB = true
+                    // Do not create a new PDB if any poor PDB exists and fixPoor is false
+                }
             } else {
                 // Rate-limit "skipping PDB creation" logs
                 key := fmt.Sprintf("%s/%s", namespace, name)
@@ -494,12 +534,18 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
                     skipLogTimes[key] = now
                 }
                 skipLogTimesLock.Unlock()
-                // Always return after handling/logging, to avoid duplicate PDBs
-                return
+                foundNonPoorMatchingPDB = true
+                // No need to create a new PDB if a non-poor one exists
             }
         }
     }
 
+    // If any matching PDB exists (poor or not), do not create a new one
+    if foundNonPoorMatchingPDB || foundPoorMatchingPDB {
+        return
+    }
+
+    // --- PDB creation logic follows as before ---
     pdbName := fmt.Sprintf("castai-%s-pdb", name)
     existingPDB, err := clientset.PolicyV1().PodDisruptionBudgets(namespace).Get(ctx, pdbName, metav1.GetOptions{})
     exists := err == nil
@@ -602,6 +648,7 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
         }
     }
 }
+
 
 
 func deletePDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, obj interface{}) {
@@ -709,7 +756,6 @@ func scanAllPDBsForPoorConfig(ctx context.Context, clientset *kubernetes.Clients
         return
     }
     for _, pdb := range pdbs.Items {
-        // Build a selector from the PDB spec
         if pdb.Spec.Selector == nil {
             continue
         }
@@ -719,10 +765,14 @@ func scanAllPDBsForPoorConfig(ctx context.Context, clientset *kubernetes.Clients
             continue
         }
 
-        // Find all matching Deployments
+        // Check Deployments
         deployments, err := clientset.AppsV1().Deployments(pdb.Namespace).List(ctx, metav1.ListOptions{})
         if err == nil {
             for _, deploy := range deployments.Items {
+                // Skip if bypass annotation is set
+                if deploy.Annotations != nil && deploy.Annotations[annotationBypass] == "true" {
+                    continue
+                }
                 if selector.Matches(labels.Set(deploy.Spec.Template.Labels)) {
                     replicas := int32(1)
                     if deploy.Spec.Replicas != nil {
@@ -733,10 +783,14 @@ func scanAllPDBsForPoorConfig(ctx context.Context, clientset *kubernetes.Clients
             }
         }
 
-        // Find all matching StatefulSets
+        // Check StatefulSets
         statefulsets, err := clientset.AppsV1().StatefulSets(pdb.Namespace).List(ctx, metav1.ListOptions{})
         if err == nil {
             for _, sts := range statefulsets.Items {
+                // Skip if bypass annotation is set
+                if sts.Annotations != nil && sts.Annotations[annotationBypass] == "true" {
+                    continue
+                }
                 if selector.Matches(labels.Set(sts.Spec.Template.Labels)) {
                     replicas := int32(1)
                     if sts.Spec.Replicas != nil {
@@ -748,6 +802,7 @@ func scanAllPDBsForPoorConfig(ctx context.Context, clientset *kubernetes.Clients
         }
     }
 }
+
 
 func isPoorPDBConfig(pdb *policyv1.PodDisruptionBudget, replicas int32) bool {
     if pdb.Spec.MinAvailable != nil {
