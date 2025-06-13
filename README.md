@@ -50,6 +50,7 @@ metadata:
 data:
   minAvailable: "1"
   # maxUnavailable: "50%"  # Optional, use one or the other
+  FixPoorPDBs: "true"  # Set to "true" to auto-fix poor PDBs, "false" to only warn
 ```
 
 ---
