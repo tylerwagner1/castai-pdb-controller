@@ -1,0 +1,124 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: poor-pdb-ns
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minavailable-equals-replicas
+  namespace: poor-pdb-ns
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: minavailable-equals-replicas
+  template:
+    metadata:
+      labels:
+        app: minavailable-equals-replicas
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: minavailable-equals-replicas-pdb
+  namespace: poor-pdb-ns
+spec:
+  minAvailable: 3
+  selector:
+    matchLabels:
+      app: minavailable-equals-replicas
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minavailable-100-percent
+  namespace: poor-pdb-ns
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: minavailable-100-percent
+  template:
+    metadata:
+      labels:
+        app: minavailable-100-percent
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: minavailable-100-percent-pdb
+  namespace: poor-pdb-ns
+spec:
+  minAvailable: "100%"
+  selector:
+    matchLabels:
+      app: minavailable-100-percent
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: maxunavailable-zero
+  namespace: poor-pdb-ns
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: maxunavailable-zero
+  template:
+    metadata:
+      labels:
+        app: maxunavailable-zero
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: maxunavailable-zero-pdb
+  namespace: poor-pdb-ns
+spec:
+  maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: maxunavailable-zero
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: maxunavailable-zero-percent
+  namespace: poor-pdb-ns
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: maxunavailable-zero-percent
+  template:
+    metadata:
+      labels:
+        app: maxunavailable-zero-percent
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: maxunavailable-zero-percent-pdb
+  namespace: poor-pdb-ns
+spec:
+  maxUnavailable: "0%"
+  selector:
+    matchLabels:
+      app: maxunavailable-zero-percent

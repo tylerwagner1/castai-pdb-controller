@@ -165,3 +165,10 @@ spec:
 
 For advanced usage, deployment via Helm, or troubleshooting, see the [controller source code](./main.go) and your cluster’s RBAC configuration.
 
+If you decide to remove the castai-pdb-controller from your cluster, you need to run the following clean-up command if you'd like all custom-created PDBs to also be deleted.
+
+```yaml
+kubectl get poddisruptionbudget --all-namespaces -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name" \
+  | awk '$2 ~ /^castai-.*-pdb$/ {print "kubectl delete poddisruptionbudget -n " $1 " " $2}' \
+  | sh
+```

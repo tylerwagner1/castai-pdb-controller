@@ -4,6 +4,7 @@ metadata:
   name: castai-pdb-controller-config
   namespace: castai-agent
 data:
-  minAvailable: "25%"        # Default minAvailable if no annotation is set
-  # maxUnavailable: "50%"  # (Optional) Default maxUnavailable if no annotation is set
+  minAvailable: "1"
+  # maxUnavailable: "50%"  # Optional, use one or the other. Built-in defaults used if both are uncommented.
+  FixPoorPDBs: "true"      # Set to "true" for automatic correction, "false" for logging only
 
