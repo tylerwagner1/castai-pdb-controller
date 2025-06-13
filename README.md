@@ -9,16 +9,27 @@ This controller enables safe, automated disruption management with per-workload 
 
 - **Automatic PDB Creation/Update:**  
   Ensures every eligible Deployment/StatefulSet has a PDB, using defaults or per-workload overrides.
+
 - **Annotation-Based Customization:**  
   Users can set `minAvailable`, `maxUnavailable`, or opt out of PDB management with annotations.
+
 - **Dynamic Default Configuration:**  
-  Cluster-wide default PDB values are set via a ConfigMap and can be changed at runtime without redeploying the controller.
+    Cluster-wide default PDB values are set via a ConfigMap and can be changed at runtime without redeploying the controller.
+
+- **Automatic Detection and Handling of Poor PDB Configurations:**  
+  The controller detects overly restrictive or ineffective PodDisruptionBudgets (such as `minAvailable` equal to replicas, `minAvailable: 100%`, or `maxUnavailable: 0/0%`) that could block voluntary disruptions or cause operational issues.
+  
+  Through the `FixPoorPDBs` option in the `castai-pdb-controller-config` ConfigMap, you can choose whether the controller should only warn about these poor configurations (default) or automatically delete and recreate them with safe defaults. This ensures cluster upgrades, node drains, and scaling operations are not blocked by problematic PDBs.
+
 - **Live Reconciliation:**  
   If annotations or ConfigMap values change, existing PDBs are updated automatically to reflect new requirements.
+
 - **Bypass Support:**  
   Workloads can opt out of automatic PDB management at any time by adding a bypass annotation.
+
 - **Garbage Collection:**  
   Orphaned PDBs are cleaned up when workloads are deleted or change state.
+
 - **Leader Election:**  
   Supports safe, highly available operation in multi-replica controller deployments.
 
