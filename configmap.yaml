@@ -4,7 +4,10 @@ metadata:
   name: castai-pdb-controller-config
   namespace: castai-agent
 data:
-  minAvailable: "1"
-  # maxUnavailable: "50%"  # Optional, use one or the other. Built-in defaults used if both are uncommented.
-  FixPoorPDBs: "false"      # Set to "true" for automatic correction, "false" for logging only
-
+  defaultMinAvailable: "1"
+#  defaultMaxUnavailable: "25%"
+  FixPoorPDBs: "false"
+  logInterval: "15m"
+  pdbScanInterval: "2m"
+  garbageCollectInterval: "2m"
+  pdbDumpInterval: "5m"

@@ -3,6 +3,8 @@ package main
 import (
     "context"
     "fmt"
+    "io"
+    "log"
     "os"
     "os/signal"
     "strconv"
@@ -10,8 +12,6 @@ import (
     "sync"
     "syscall"
     "time"
-    "log"
-    "io"
 
     appsv1 "k8s.io/api/apps/v1"
     policyv1 "k8s.io/api/policy/v1"
@@ -27,6 +27,7 @@ import (
     "k8s.io/client-go/tools/leaderelection"
     "k8s.io/client-go/tools/leaderelection/resourcelock"
     apierrors "k8s.io/apimachinery/pkg/api/errors"
+    "sigs.k8s.io/yaml"
 )
 
 const (
@@ -35,15 +36,21 @@ const (
     annotationMinAvailable   = "workloads.cast.ai/pdb-minAvailable"
     annotationMaxUnavailable = "workloads.cast.ai/pdb-maxUnavailable"
     annotationBypass         = "workloads.cast.ai/bypass-default-pdb"
-    skipLogInterval          = 15 * time.Minute
-    warnLogInterval = 15 * time.Minute // or whatever interval you prefer
-    fixLogInterval = 15 * time.Minute // or whatever interval you prefer
+    defaultLogInterval       = 15 * time.Minute
+    defaultPDBScanInterval   = 2 * time.Minute
+    defaultGarbageCollectInterval = 2 * time.Minute
+    defaultPDBDumpInterval   = 5 * time.Minute
+    pdbDumpFile              = "/tmp/castai-pdbs.yaml"
 )
 
 type DefaultPDBConfig struct {
-    MinAvailable   *intstr.IntOrString
-    MaxUnavailable *intstr.IntOrString
-    FixPoorPDBs    bool
+    MinAvailable           *intstr.IntOrString
+    MaxUnavailable         *intstr.IntOrString
+    FixPoorPDBs            bool
+    LogInterval            time.Duration
+    PDBScanInterval        time.Duration
+    GarbageCollectInterval time.Duration
+    PDBDumpInterval        time.Duration
 }
 
 var (
@@ -54,16 +61,37 @@ var (
     skipLogTimesLock sync.Mutex
     warnLogTimes     = make(map[string]time.Time)
     warnLogTimesLock sync.Mutex
-    fixLogTimes     = make(map[string]time.Time)
-    fixLogTimesLock sync.Mutex
+    fixLogTimes      = make(map[string]time.Time)
+    fixLogTimesLock  sync.Mutex
 )
+
+// parseDurationFromConfigMap parses a duration string from the ConfigMap (e.g., "5m", "30s") and returns a time.Duration.
+// Falls back to the provided default if the value is missing or invalid.
+func parseDurationFromConfigMap(data map[string]string, key string, defaultDuration time.Duration) time.Duration {
+    if val, ok := data[key]; ok {
+        duration, err := time.ParseDuration(val)
+        if err != nil {
+            log.Printf("Invalid duration for %s in ConfigMap: %v, using default %v", key, err, defaultDuration)
+            return defaultDuration
+        }
+        if duration <= 0 {
+            log.Printf("Non-positive duration for %s in ConfigMap: %v, using default %v", key, duration, defaultDuration)
+            return defaultDuration
+        }
+        return duration
+    }
+    return defaultDuration
+}
 
 // logging for FixPoorPDB behavior
 func logFixPoorPDB(key, message string) {
     now := time.Now()
+    defaultPDBConfigLock.RLock()
+    interval := defaultPDBConfig.LogInterval
+    defaultPDBConfigLock.RUnlock()
     fixLogTimesLock.Lock()
     last, ok := fixLogTimes[key]
-    if !ok || now.Sub(last) > fixLogInterval {
+    if !ok || now.Sub(last) > interval {
         log.Print(message)
         fixLogTimes[key] = now
     }
@@ -73,9 +101,12 @@ func logFixPoorPDB(key, message string) {
 // logging for WarnPoorPDB behavior
 func logPoorPDBWarning(key, message string) {
     now := time.Now()
+    defaultPDBConfigLock.RLock()
+    interval := defaultPDBConfig.LogInterval
+    defaultPDBConfigLock.RUnlock()
     warnLogTimesLock.Lock()
     last, ok := warnLogTimes[key]
-    if !ok || now.Sub(last) > warnLogInterval {
+    if !ok || now.Sub(last) > interval {
         log.Print(message)
         warnLogTimes[key] = now
     }
@@ -154,6 +185,60 @@ func main() {
     })
 }
 
+// MinimalPDB is a struct for serializing PDBs with only essential fields.
+type MinimalPDB struct {
+    APIVersion string            `yaml:"apiVersion"`
+    Kind       string            `yaml:"kind"`
+    Metadata   MinimalMetadata   `yaml:"metadata"`
+    Spec       policyv1.PodDisruptionBudgetSpec `yaml:"spec"`
+}
+
+// MinimalMetadata includes only name and namespace for PDB metadata.
+type MinimalMetadata struct {
+    Name      string `yaml:"name"`
+    Namespace string `yaml:"namespace"`
+}
+
+// Dumps all castai-created PDBs to a YAML file in /tmp, overwriting on each run.
+func dumpCastaiPDBsToFile(ctx context.Context, clientset *kubernetes.Clientset) {
+    pdbs, err := clientset.PolicyV1().PodDisruptionBudgets("").List(ctx, metav1.ListOptions{})
+    if err != nil {
+        log.Printf("Failed to list PDBs for dumping to file: %v", err)
+        return
+    }
+
+    var yamlOutput []string
+    for _, pdb := range pdbs.Items {
+        if strings.HasPrefix(pdb.Name, "castai-") && strings.HasSuffix(pdb.Name, "-pdb") {
+            // Create a minimal PDB object for clean YAML output
+            minimalPDB := MinimalPDB{
+                APIVersion: "policy/v1",
+                Kind:       "PodDisruptionBudget",
+                Metadata: MinimalMetadata{
+                    Name:      pdb.Name,
+                    Namespace: pdb.Namespace,
+                },
+                Spec:       pdb.Spec,
+            }
+            pdbYaml, err := yaml.Marshal(&minimalPDB)
+            if err != nil {
+                log.Printf("Failed to marshal PDB %s/%s to YAML: %v", pdb.Namespace, pdb.Name, err)
+                continue
+            }
+            yamlOutput = append(yamlOutput, string(pdbYaml))
+        }
+    }
+
+    // Write to file, overwriting any existing content
+    output := strings.Join(yamlOutput, "\n---\n")
+    err = os.WriteFile(pdbDumpFile, []byte(output), 0644)
+    if err != nil {
+        log.Printf("Failed to write PDBs to %s: %v", pdbDumpFile, err)
+        return
+    }
+    log.Printf("Successfully wrote %d castai PDBs to %s", len(yamlOutput), pdbDumpFile)
+}
+
 // watches when there are configMap changes
 func watchConfigMap(ctx context.Context, clientset *kubernetes.Clientset) {
     factory := informers.NewSharedInformerFactoryWithOptions(
@@ -189,10 +274,10 @@ func watchConfigMap(ctx context.Context, clientset *kubernetes.Clientset) {
 // makes necessary updates to default behavior
 func updateDefaultPDBConfig(cm *corev1.ConfigMap, clientset *kubernetes.Clientset) {
     var minAvailable, maxUnavailable *intstr.IntOrString
-    if val, ok := cm.Data["minAvailable"]; ok {
+    if val, ok := cm.Data["defaultMinAvailable"]; ok {
         minAvailable = parsePDBValue(val)
     }
-    if val, ok := cm.Data["maxUnavailable"]; ok {
+    if val, ok := cm.Data["defaultMaxUnavailable"]; ok {
         maxUnavailable = parsePDBValue(val)
     }
     fixPoorPDBs := false
@@ -200,16 +285,31 @@ func updateDefaultPDBConfig(cm *corev1.ConfigMap, clientset *kubernetes.Clientse
         fixPoorPDBs = true
     }
     if minAvailable != nil && maxUnavailable != nil {
-        log.Printf("Invalid default PDB config: both minAvailable and maxUnavailable set in ConfigMap\n")
+        log.Printf("Invalid default PDB config: both defaultMinAvailable and defaultMaxUnavailable set in ConfigMap\n")
         minAvailable = nil
         maxUnavailable = nil
     }
+
+    // Parse interval settings from ConfigMap
+    logInterval := parseDurationFromConfigMap(cm.Data, "logInterval", defaultLogInterval)
+    pdbScanInterval := parseDurationFromConfigMap(cm.Data, "pdbScanInterval", defaultPDBScanInterval)
+    garbageCollectInterval := parseDurationFromConfigMap(cm.Data, "garbageCollectInterval", defaultGarbageCollectInterval)
+    pdbDumpInterval := parseDurationFromConfigMap(cm.Data, "pdbDumpInterval", defaultPDBDumpInterval)
+
     defaultPDBConfigLock.Lock()
     defaultPDBConfig.MinAvailable = minAvailable
     defaultPDBConfig.MaxUnavailable = maxUnavailable
     defaultPDBConfig.FixPoorPDBs = fixPoorPDBs
+    defaultPDBConfig.LogInterval = logInterval
+    defaultPDBConfig.PDBScanInterval = pdbScanInterval
+    defaultPDBConfig.GarbageCollectInterval = garbageCollectInterval
+    defaultPDBConfig.PDBDumpInterval = pdbDumpInterval
     defaultPDBConfigLock.Unlock()
-    log.Printf("Default PDB config updated from ConfigMap: minAvailable=%v, maxUnavailable=%v, FixPoorPDBs=%v\n", minAvailable, maxUnavailable, fixPoorPDBs)
+
+    log.Printf("Default PDB config updated from ConfigMap: defaultMinAvailable=%v, defaultMaxUnavailable=%v, FixPoorPDBs=%v, "+
+        "logInterval=%v, pdbScanInterval=%v, garbageCollectInterval=%v, pdbDumpInterval=%v\n",
+        minAvailable, maxUnavailable, fixPoorPDBs, logInterval, pdbScanInterval,
+        garbageCollectInterval, pdbDumpInterval)
 
     // Reconcile all PDBs that use defaults
     go reconcileAllDefaultPDBs(context.Background(), clientset)
@@ -222,6 +322,10 @@ func resetDefaultPDBConfig() {
     defaultPDBConfig.MinAvailable = nil
     defaultPDBConfig.MaxUnavailable = nil
     defaultPDBConfig.FixPoorPDBs = false
+    defaultPDBConfig.LogInterval = defaultLogInterval
+    defaultPDBConfig.PDBScanInterval = defaultPDBScanInterval
+    defaultPDBConfig.GarbageCollectInterval = defaultGarbageCollectInterval
+    defaultPDBConfig.PDBDumpInterval = defaultPDBDumpInterval
     defaultPDBConfigLock.Unlock()
     log.Printf("Default PDB config reset: using built-in fallback\n")
 }
@@ -254,13 +358,25 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset) {
         DeleteFunc: func(obj interface{}) { deletePDBForWorkload(ctx, clientset, obj) },
     })
 
-    // Periodically scan for poor or duplicate PDBs every minute
+    // Periodically scan for poor and multiple PDBs
     go func() {
-        ticker := time.NewTicker(2 * time.Minute)
+        defaultPDBConfigLock.RLock()
+        interval := defaultPDBConfig.PDBScanInterval
+        defaultPDBConfigLock.RUnlock()
+        ticker := time.NewTicker(interval)
         defer ticker.Stop()
         for {
             select {
             case <-ticker.C:
+                defaultPDBConfigLock.RLock()
+                newInterval := defaultPDBConfig.PDBScanInterval
+                defaultPDBConfigLock.RUnlock()
+                if newInterval != interval {
+                    ticker.Stop()
+                    ticker = time.NewTicker(newInterval)
+                    interval = newInterval
+                    log.Printf("Updated PDB scan interval to %v", interval)
+                }
                 scanAllPDBsForPoorConfig(ctx, clientset)
                 scanAllPDBsForMultiplePDBs(ctx, clientset)
             case <-ctx.Done():
@@ -269,15 +385,54 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset) {
         }
     }()
 
-    // Periodically garbage collect orphaned PDBs every 2 minutes
+    // Periodically garbage collect orphaned PDBs
     go func() {
+        defaultPDBConfigLock.RLock()
+        interval := defaultPDBConfig.GarbageCollectInterval
+        defaultPDBConfigLock.RUnlock()
         garbageCollectOrphanedPDBs(ctx, clientset)
-        ticker := time.NewTicker(2 * time.Minute)
+        ticker := time.NewTicker(interval)
         defer ticker.Stop()
         for {
             select {
             case <-ticker.C:
+                defaultPDBConfigLock.RLock()
+                newInterval := defaultPDBConfig.GarbageCollectInterval
+                defaultPDBConfigLock.RUnlock()
+                if newInterval != interval {
+                    ticker.Stop()
+                    ticker = time.NewTicker(newInterval)
+                    interval = newInterval
+                    log.Printf("Updated garbage collect interval to %v", interval)
+                }
                 garbageCollectOrphanedPDBs(ctx, clientset)
+            case <-ctx.Done():
+                return
+            }
+        }
+    }()
+
+    // Periodically dump castai PDBs to YAML file
+    go func() {
+        defaultPDBConfigLock.RLock()
+        interval := defaultPDBConfig.PDBDumpInterval
+        defaultPDBConfigLock.RUnlock()
+        dumpCastaiPDBsToFile(ctx, clientset)
+        ticker := time.NewTicker(interval)
+        defer ticker.Stop()
+        for {
+            select {
+            case <-ticker.C:
+                defaultPDBConfigLock.RLock()
+                newInterval := defaultPDBConfig.PDBDumpInterval
+                defaultPDBConfigLock.RUnlock()
+                if newInterval != interval {
+                    ticker.Stop()
+                    ticker = time.NewTicker(newInterval)
+                    interval = newInterval
+                    log.Printf("Updated PDB dump interval to %v", interval)
+                }
+                dumpCastaiPDBsToFile(ctx, clientset)
             case <-ctx.Done():
                 return
             }
@@ -293,8 +448,7 @@ func runController(ctx context.Context, clientset *kubernetes.Clientset) {
     <-ctx.Done()
 }
 
-
-// watches for changes to the custom annoations (min, max, and bypass)
+// watches for changes to the custom annotations (min, max, and bypass)
 func handleWorkloadUpdate(ctx context.Context, clientset *kubernetes.Clientset, oldObj, newObj interface{}) {
     var oldAnnotations, newAnnotations map[string]string
     var namespace, name string
@@ -540,6 +694,7 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
     fixPoor := false
     defaultPDBConfigLock.RLock()
     fixPoor = defaultPDBConfig.FixPoorPDBs
+    logInterval := defaultPDBConfig.LogInterval
     defaultPDBConfigLock.RUnlock()
 
     for _, pdb := range pdbList.Items {
@@ -562,7 +717,7 @@ func createPDBForWorkload(ctx context.Context, clientset *kubernetes.Clientset, 
                     now := time.Now()
                     skipLogTimesLock.Lock()
                     last, ok := skipLogTimes[key]
-                    if !ok || now.Sub(last) > skipLogInterval {
+                    if !ok || now.Sub(last) > logInterval {
                         log.Printf("Skipping PDB creation for %s/%s: overlapping PDB %s exists\n", namespace, name, pdb.Name)
                         skipLogTimes[key] = now
                     }
