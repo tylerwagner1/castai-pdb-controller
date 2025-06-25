@@ -5,9 +5,9 @@ replicaCount: 2
 # Container image configuration
 image:
   # Container image repository
-  repository: tylerwagner/castai-pdb-controller
+  repository: castai/castai-pdb-controller
   # Container image tag
-  tag: "1.32"
+  tag: "latest"
   # Container image pull policy
   pullPolicy: IfNotPresent
 
