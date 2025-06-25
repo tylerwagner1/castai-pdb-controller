@@ -59,8 +59,8 @@ helm install castai-pdb-controller ./helm/castai-pdb-controller -f custom-values
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `replicaCount` | Number of controller replicas | `2` |
-| `image.repository` | Container image repository | `tylerwagner/castai-pdb-controller` |
-| `image.tag` | Container image tag | `"1.32"` |
+| `image.repository` | Container image repository | `castai/castai-pdb-controller` |
+| `image.tag` | Container image tag | `"latest"` |
 | `image.pullPolicy` | Container image pull policy | `IfNotPresent` |
 | `nameOverride` | Override the chart name | `""` |
 | `fullnameOverride` | Override the full app name | `""` |
@@ -127,7 +127,7 @@ helm upgrade castai-pdb-controller ./helm/castai-pdb-controller
 
 # Upgrade with new values
 helm upgrade castai-pdb-controller ./helm/castai-pdb-controller \
-  --set image.tag="1.33" \
+  --set image.tag="latest" \
   --set config.minAvailable="2"
 ```
 
